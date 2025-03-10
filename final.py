@@ -7,17 +7,21 @@ import wave
 from ultralytics import YOLO
 import pyaudio
 import json
-model_path = "/Users/evansvetina/Downloads/vosk-model-small-en-us-0.15"  # Update this path with your model directory
+import time
 
+model_path = "/Users/evansvetina/Downloads/vosk-model-small-en-us-0.15"  # Update this path with your model directory
 
 vosk_model = Model(model_path)
 recognizer = KaldiRecognizer(vosk_model, 16000)
+
+# Global variable to store detected objects between frames
+detected_objects = []
 
 def init_model():
     """Initialize the YOLO model"""
     try:
         # Load the YOLOv5 model
-        model = YOLO('/Users/nikhil/Downloads/best (1).pt')
+        model = YOLO('/Users/evansvetina/Downloads/best (1).pt')
         model.conf = 0.25
         model.iou = 0.45
         return model
@@ -36,8 +40,8 @@ def init_camera():
 def listen_for_command():
     """
     Listen for voice command using Vosk
+    Listens for up to 3 seconds for a command
     """
-    print("Listening for command...")
     p = None
     stream = None
     try:
@@ -65,24 +69,29 @@ def listen_for_command():
             rate=16000,
             input=True,
             input_device_index=input_device_index,
-            frames_per_buffer=8192
+            frames_per_buffer=4096
         )
         
         stream.start_stream()
         
+        # Set maximum listening time to 3 seconds
+        start_time = time.time()
+        max_listen_time = 3  # Listen for up to 3 seconds
+        
         try:
-            print("Recording audio...")
-            while True:
+            while time.time() - start_time < max_listen_time:
                 data = stream.read(4096, exception_on_overflow=False)
+                
                 if recognizer.AcceptWaveform(data):
                     result_json = recognizer.Result()
                     # Parse the JSON string and extract the text
                     result_dict = json.loads(result_json)
                     result = result_dict.get('text', '')
-                    stream.stop_stream()
-                    stream.close()
-                    p.terminate()
-                    return result
+                    if result:  # Only return if we got an actual command
+                        return result
+            
+            # If we reach here, we didn't get a command in the time allotted
+            return None
                     
         except Exception as e:
             print(f"Error recording audio: {e}")
@@ -101,12 +110,20 @@ def listen_for_command():
         
 def process_frame(frame, model):
     """Process a single frame with object detection"""
+    global detected_objects  # Make this a global variable to persist between frames
+    
+    # Only reset the detected objects list if new objects are found
+    current_detected_objects = []
+    
     try:
+        # Check if model is None
+        if model is None:
+            return frame, detected_objects
+            
         # Perform inference
         results = model(frame, verbose=False)
         
         # Process detections
-        detected_objects = []
         for r in results:
             boxes = r.boxes
             for box in boxes:
@@ -127,10 +144,13 @@ def process_frame(frame, model):
                 # Add labels
                 conf = float(box.conf[0])
                 cls = int(box.cls[0])
-                label = f"{model.names[cls]} {conf:.2f}"
-                detected_objects.append({
-                    'class': model.names[int(cls)],
-                    'center': (int(center_x), int(center_y)),
+                class_name = model.names[cls]
+                label = f"{class_name} {conf:.2f}"
+                
+                # Store the detected object
+                current_detected_objects.append({
+                    'class': class_name,
+                    'center': (center_x, center_y),
                     'confidence': conf  
                 })
                 
@@ -143,60 +163,88 @@ def process_frame(frame, model):
                 cv2.putText(frame, center_text, (center_x + 10, center_y - 10), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
+        # Only update detected_objects if we found objects
+        if current_detected_objects:
+            detected_objects = current_detected_objects
+        
         return frame, detected_objects
     except Exception as e:
-        print(f"Error processing frame: {e}")
-        return frame, detected_objects
-
+        return frame, detected_objects  # Return the frame and empty list
 
 
 # Initialize model
 model = init_model()
-if model is None:
-    print("Failed to load model.")
 
 # Initialize camera
 cap = init_camera()
-if cap is None:
-    print("Failed to initialize camera.")
-   
 
-print("Object detection started. Press 'q' to quit.")
+# Initialize the speech recognizer once to avoid reopening it repeatedly
+
+   
+# Use time-based intervals instead of frame-based intervals
+import time
+last_voice_check_time = time.time()
+VOICE_CHECK_INTERVAL_SECONDS = 5  # Check for voice commands every 5 seconds
+
 
 try:
     while True:
         # Read frame
         ret, frame = cap.read()
         if not ret:
-            print("Error: Failed to capture image.")
             break
+            
         # Process frame
         processed_frame, detected_objects = process_frame(frame, model)
 
         # Display frame
         cv2.imshow('YOLOv5 Object Detection', processed_frame)
 
-        command = listen_for_command()
-        if command:
-            print(f"Command recognized: {command}")
-            for obj in detected_objects:
-                if command.lower() in obj['class'].lower():
-                    print(f"Selected object: {obj['class']} at center point {obj['center']}")
+        # Check for voice commands every 5 seconds
+        current_time = time.time()
+        if current_time - last_voice_check_time >= VOICE_CHECK_INTERVAL_SECONDS:
+            last_voice_check_time = current_time
+            
+            # Check for voice commands
+            command = listen_for_command()
+            
+            # Process command if we got one
+            if command:
+                found_match = False
+                # Convert command to lowercase for case-insensitive comparison
+                command_lower = command.lower().strip()
+                
+                # Try a more flexible matching approach
+                for obj in detected_objects:
+                    # Get the object class and make it lowercase
+                    obj_class = obj['class'].lower().strip()
                     
-                else: 
-                    print("No matching object found for the command.")
-
+                    # Check for partial matches in either direction
+                    if (command_lower in obj_class) or (obj_class in command_lower) or \
+                       ('bandage' in command_lower and 'bandage' in obj_class) or \
+                       ('scissor' in command_lower and 'scissor' in obj_class):
+                        
+                        # Format the center coordinates as x,y,z with y always 0
+                        center_x, center_y = obj['center']
+                        print(f"{center_x},0,{center_y}")
+                        found_match = True
+                        break  # Exit after first match
+                
+                if not found_match:
+                    print(f"No matching object found for the command '{command}'.")
+        
+        # Process key presses
+        key = cv2.waitKey(1) & 0xFF
+        
         # Check for quit command
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("Quitting...")
+        if key == ord('q'):
             break
 
 except Exception as e:
-    print(f"An error occurred: {e}")
+    pass
 
 finally:
     # Clean up
-    cap.release()
+    if cap is not None:
+        cap.release()
     cv2.destroyAllWindows()
-
-
